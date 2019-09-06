@@ -16,7 +16,6 @@ import static spark.Spark.*;
  * This MapServer class is the entry point for running the JavaSpark web server for the BearMaps
  * application project, receiving API calls, handling the API call processing, and generating
  * requested images and routes.
- * @author Alan Yao
  */
 public class MapServer {
     /**
@@ -166,6 +165,112 @@ public class MapServer {
         return params;
     }
 
+    public int getDepth(Map<String, Double> params) {
+        double xDist = params.get("ullon") - params.get("lrlon");
+        // calculate the distance per pixel
+        double dpp = Math.abs(xDist / params.get("w"));
+        int depth = 0;
+        double tDPP = (ROOT_LRLON-ROOT_ULLON)/(TILE_SIZE);
+        // calculate the depth(in the quad tree) of the images to be rastered
+        while(tDPP>dpp) {
+            depth++;
+            tDPP = (ROOT_LRLON-ROOT_ULLON)/((int)(Math.pow(2, depth))*TILE_SIZE);
+        }
+        // maximum depth of the quadtree is 7
+        // zooming in any further does nothing
+        return Math.min(depth, 7);
+    }
+
+    public int getImageHeight(ArrayList<QuadTree.QTreeNode> tiles) {
+        int height = 1; 
+        // calculate the height (in tiles) of the buffered image
+        for (int i = 1; i<tiles.size(); i++) {
+            if (tiles.get(i).getUllat() < tiles.get(i - 1).getUllat()) {
+                height++;
+            } 
+        }
+        return height;
+    }
+
+    public void drawTiles(ArrayList<QuadTree.QTreeNode> tiles) {
+        // x and y indicate the postion of the top-left of the image
+        int x = 0, y = 0;
+            
+        for (int i = 0; i < tiles.size(); i++) {
+            QuadTree.QTreeNode node = tiles.get(i);
+            BufferedImage bi = ImageIO.read(new File("img/" + node.getFileName() + ".png"));
+            // draw image bi with (x, y) as coordinate of top-left of the image
+            graph.drawImage(bi, x, y, null);
+            // every image is 256x256
+            x += 256;
+            if (i<tiles.size()-1) {
+                if (tiles.get(i+1).getUllat() < node.getUllat()) {
+                    // draw the next image on a new row
+                    x = 0;
+                    y += 256;
+                }
+            }
+        }
+    }
+
+    // use Dijkstra's algorithm to find route between startNode and endNode
+    public LinkedList<Long> AStarSearch(Node startNode, Node endNode) {
+        route  = new LinkedList<>();
+        HashSet<Node> visited = new HashSet<>();
+        HashMap<Node, Double> distances = new HashMap<>();
+        HashMap<Node, Node> prev = new HashMap<>();
+        PriorityQueue<Node> fringe = new PriorityQueue<>();
+        fringe.add(startNode);
+        distances.put(startNode, 0.0);
+        while (fringe.size()>0) {
+            Node v = fringe.poll();
+            if (visited.contains(v)) {
+                continue;
+            }
+            visited.add(v);
+            if(v==endNode) {
+                break;
+            }
+            for (Connections c: v.connectionsSet) {
+                if(!distances.containsKey(c.n2) || distances.get(c.n2) > distances.get(v) + Math.sqrt((c.n2.lon-v.lon)*(c.n2.lon-v.lon)+(c.n2.lat-v.lat)*(c.n2.lat-v.lat))) {
+                    distances.put(c.n2, distances.get(v) + Math.sqrt((c.n2.lon-v.lon)*(c.n2.lon-v.lon)+(c.n2.lat-v.lat)*(c.n2.lat-v.lat)));
+                    c.n2.setFn(Math.sqrt((c.n2.lon-endNode.lon)*(c.n2.lon-endNode.lon)+(c.n2.lat-endNode.lat)*(c.n2.lat-endNode.lat)) + distances.get(c.n2));
+                    fringe.add(c.n2);
+                    prev.put(c.n2, v);
+                }
+
+            }
+        }
+        Node N = endNode;
+        while(prev.get(N) != startNode) {
+            route.addFirst(N.id);
+            N = prev.get(N);
+        }
+        route.addFirst(N.id);
+        route.addFirst(startNode.id);
+        return route;
+
+    }
+
+    // finds the closest Location to the specified longitude and latitude
+    public Node findClosest(double lon, double lat) {
+        Node closestNode = null;
+        double dist = Double.MAX_VALUE;
+        // iterate through all locations to find the closest
+        for (Map.Entry<Long, Node> entry: g.getConnected().entrySet()) {
+            Node n = entry.getValue();
+            // euclidean distance
+            double newDist = Math.sqrt((startLon-n.lon)*(startLon-n.lon)+(startLat-n.lat)*(startLat-n.lat));
+            // check if we found a closer location
+            if (newDist < dist) {
+                startNode = n;
+                dist = newDist;
+            }
+        }
+        return closestNode;
+
+    }
+
 
     /**
      * Handles raster API calls, queries for tiles and rasters the full image. <br>
@@ -202,85 +307,59 @@ public class MapServer {
      * @see #REQUIRED_RASTER_REQUEST_PARAMS
      */
     public static Map<String, Object> getMapRaster(Map<String, Double> params, OutputStream os) {
-        double xDlst = params.get("ullon") - params.get("lrlon");
-        double dpp = Math.abs(xDlst / params.get("w"));
+        // this Quadtree contains all "zoom levels"
         QuadTree map = new QuadTree();
-        int depth = 0;
-        double tDPP = (ROOT_LRLON-ROOT_ULLON)/(TILE_SIZE);
-        while(tDPP>dpp) {
-            depth++;
-            tDPP = (ROOT_LRLON-ROOT_ULLON)/((int)(Math.pow(2, depth))*TILE_SIZE);
-
-        }
-        if (depth > 7) {
-            depth = 7;
-        }
+        // calculates the depth of the images to be rastered
+        int depth = getDepth(params);
+        // stores the images to be rastered
         ArrayList<QuadTree.QTreeNode> tiles = new ArrayList<>();
+        // collect the correct images based on lat and lon values of query window
         map.traverseDepth(map.root(), depth, params.get("ullat"), params.get("lrlat"), params.get("ullon"), params.get("lrlon"), tiles);
+        // sorts the tiles by longitude and latitude
         Collections.sort(tiles);
+        // must contain the parameters for the json response
         HashMap<String, Object> rasteredImageParams = new HashMap<>();
         try {
-            int count4 = 0;
-            int count3 = 0;
-            for (int k = 0; k<tiles.size(); k++) {
-                if (k > 0) {
-                    if (tiles.get(k).getUllat() < tiles.get(k - 1).getUllat()) {
-                        count3 = 0;
-                        count4++;
-                    } else {
-                        count3++;
-                    }
-                }
-            }
-            count4++;
-            count3++;
-            BufferedImage im = new BufferedImage(count3 * 256, count4 * 256, BufferedImage.TYPE_INT_RGB);
+            // calculate the height in terms of tiles of the image to be rastered
+            int height = getImageHeight(tiles); 
+            BufferedImage im = new BufferedImage((tiles.size()/height) * 256, height * 256, BufferedImage.TYPE_INT_RGB);
             Graphics graph = im.getGraphics();
-            int x = 0;
-            int y = 0;
-            int count1 = 0;
-            int count2 = 0;
-            for (int i = 0; i < tiles.size(); i++) {
-                QuadTree.QTreeNode node = tiles.get(i);
-                BufferedImage bi = ImageIO.read(new File("img/" + node.getFileName() + ".png"));
-                graph.drawImage(bi, x, y, null);
-                x += 256;
-                count1 += 1;
-                if (i<tiles.size()-1) {
-                    if (tiles.get(i+1).getUllat() < node.getUllat()) {
-                        x = 0;
-                        y += 256;
-                        count2++;
-                    }
-                }
-            }
-            count2++;
-            double h = count2 * 256;
-            double w = (count1/count2) * 256;
-            double wDDP = (tiles.get(tiles.size()-1).getLrlon()-tiles.get(0).getUllon())/w;
-            double hDDP = (tiles.get(0).getUllat()-tiles.get(tiles.size()-1).getLrlat())/h;
+            // x and y indicate the postion of the top-left of the image
+            int x = 0, y = 0;
+            // draw all the tiles on a BufferedImage
+            drawTiles(tiles);
+
+            double raster_height = height * 256;
+            double raster_width = (tiles.size()/height) * 256;
+            double wDDP = (tiles.get(tiles.size()-1).getLrlon()-tiles.get(0).getUllon())/raster_width;
+            double hDDP = (tiles.get(0).getUllat()-tiles.get(tiles.size()-1).getLrlat())/raster_height;
+            // draws a route if user requests a route between two locations
             if (route != null) {
                 Stroke stroke = new BasicStroke(MapServer.ROUTE_STROKE_WIDTH_PX, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND);
                 ((Graphics2D) graph).setStroke(stroke);
                 graph.setColor(MapServer.ROUTE_STROKE_COLOR);
                 for (int i = 0; i<route.size()-1;i++) {
-                    Node xy1 = g.getConnected().get(route.get(i));
-                    Node xy2 = g.getConnected().get(route.get(i+1));
-                    int xy1lon = (int) Math.floor((xy1.lon-tiles.get(0).getUllon())/wDDP);
-                    int xy1lat = (int) Math.floor((tiles.get(0).getUllat()-xy1.lat)/hDDP);
-                    int xy2lon = (int) Math.floor((xy2.lon-tiles.get(0).getUllon())/wDDP);
-                    int xy2lat = (int) Math.floor((tiles.get(0).getUllat()-xy2.lat)/hDDP);
-                    graph.drawLine(xy1lon,xy1lat,xy2lon, xy2lat);
+                    Node node1 = g.getConnected().get(route.get(i));
+                    Node node2 = g.getConnected().get(route.get(i+1));
+                    // calculate relative lon and lat for node1
+                    int lon1 = (int) Math.floor((node1.lon-tiles.get(0).getUllon())/wDDP);
+                    int lat1 = (int) Math.floor((tiles.get(0).getUllat()-node1.lat)/hDDP);
+                    // calculate relative lon and lat for node2
+                    int lon2 = (int) Math.floor((node2.lon-tiles.get(0).getUllon())/wDDP);
+                    int lat2 = (int) Math.floor((tiles.get(0).getUllat()-node2.lat)/hDDP);
+                    graph.drawLine(lon1, lat1, lon2, lat2);
                 }
             }
+            // required parameters
             rasteredImageParams.put("raster_ul_lon", tiles.get(0).getUllon());
             rasteredImageParams.put("raster_ul_lat", tiles.get(0).getUllat());
             rasteredImageParams.put("raster_lr_lon", tiles.get(tiles.size()-1).getLrlon());
             rasteredImageParams.put("raster_lr_lat", tiles.get(tiles.size()-1).getLrlat());
-            rasteredImageParams.put("raster_width", (int) w);
-            rasteredImageParams.put("raster_height", (int) h);
+            rasteredImageParams.put("raster_width", (int) raster_width);
+            rasteredImageParams.put("raster_height", (int) raster_height);
             rasteredImageParams.put("depth", depth);
             rasteredImageParams.put("query_success", true);
+            // write the buffered image to the output stream
             ImageIO.write(im, "png", os);
         }
         catch(IOException e) {
@@ -300,64 +379,13 @@ public class MapServer {
      * @return A LinkedList of node ids from the start of the route to the end.
      */
     public static LinkedList<Long> findAndSetRoute(Map<String, Double> params) {
-        route  = new LinkedList<>();
         double startLon = params.get("start_lon");
         double startLat = params.get("start_lat");
         double endLon = params.get("end_lon");
         double endLat = params.get("end_lat");
-        Node startNode = null;
-        double dist = Double.MAX_VALUE;
-        for (Map.Entry<Long, Node> entry: g.getConnected().entrySet()) {
-            Node n = entry.getValue();
-            double newDist = Math.sqrt((startLon-n.lon)*(startLon-n.lon)+(startLat-n.lat)*(startLat-n.lat));
-            if (newDist < dist) {
-                startNode = n;
-                dist = newDist;
-            }
-        }
-        Node endNode = null;
-        dist = Double.MAX_VALUE;
-        for (Map.Entry<Long, Node> entry: g.getConnected().entrySet()) {
-            Node n = entry.getValue();
-            double newDist = Math.sqrt((endLon-n.lon)*(endLon-n.lon)+(endLat-n.lat)*(endLat-n.lat));
-            if (newDist < dist) {
-                endNode = n;
-                dist = newDist;
-            }
-        }
-        HashSet<Node> visited = new HashSet<>();
-        HashMap<Node, Double> distan = new HashMap<>();
-        HashMap<Node, Node> prev = new HashMap<>();
-        PriorityQueue<Node> fringe = new PriorityQueue<>();
-        fringe.add(startNode);
-        distan.put(startNode, 0.0);
-        while (fringe.size()>0) {
-            Node v = fringe.poll();
-            if (visited.contains(v)) {
-                continue;
-            }
-            visited.add(v);
-            if(v==endNode) {
-                break;
-            }
-            for (Connections c: v.connectionsSet) {
-                if(!distan.containsKey(c.n2) || distan.get(c.n2) > distan.get(v) + Math.sqrt((c.n2.lon-v.lon)*(c.n2.lon-v.lon)+(c.n2.lat-v.lat)*(c.n2.lat-v.lat))) {
-                    distan.put(c.n2, distan.get(v) + Math.sqrt((c.n2.lon-v.lon)*(c.n2.lon-v.lon)+(c.n2.lat-v.lat)*(c.n2.lat-v.lat)));
-                    c.n2.setFn(Math.sqrt((c.n2.lon-endNode.lon)*(c.n2.lon-endNode.lon)+(c.n2.lat-endNode.lat)*(c.n2.lat-endNode.lat)) + distan.get(c.n2));
-                    fringe.add(c.n2);
-                    prev.put(c.n2, v);
-                }
-
-            }
-        }
-        Node N = endNode;
-        while(prev.get(N) != startNode) {
-            route.addFirst(N.id);
-            N = prev.get(N);
-        }
-        route.addFirst(N.id);
-        route.addFirst(startNode.id);
-        return route;
+        Node startNode = findClosest(startLon, startLat);
+        Node endNode = findClosest(endLon, endLat);
+        return AStarSearch(startNode, endNode);
     }
 
     /**

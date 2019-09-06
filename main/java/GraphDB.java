@@ -10,7 +10,6 @@ import javax.xml.parsers.SAXParserFactory;
 /**
  * Wraps the parsing functionality of the MapDBHandler as an example.
  * You may choose to add to the functionality of this class if you wish.
- * @author Alan Yao
  */
 public class GraphDB {
     /**
