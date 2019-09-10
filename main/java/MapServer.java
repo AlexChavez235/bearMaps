@@ -192,7 +192,7 @@ public class MapServer {
         return height;
     }
 
-    public void drawTiles(ArrayList<QuadTree.QTreeNode> tiles) {
+    public void drawTiles(ArrayList<QuadTree.QTreeNode> tiles, Graphics graph) {
         // x and y indicate the postion of the top-left of the image
         int x = 0, y = 0;
             
@@ -327,7 +327,7 @@ public class MapServer {
             // x and y indicate the postion of the top-left of the image
             int x = 0, y = 0;
             // draw all the tiles on a BufferedImage
-            drawTiles(tiles);
+            drawTiles(tiles, graph);
 
             double raster_height = height * 256;
             double raster_width = (tiles.size()/height) * 256;
